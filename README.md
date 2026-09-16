@@ -67,6 +67,20 @@ refuses any order that is no longer awaiting shipment, or that already has dimen
 so a size a packer set by hand is never overwritten. Ten orders per run, a pause
 between calls, and an order that fails is parked rather than blocking the rest.
 
+### Tags
+
+After the dimensions are written, the order is tagged with its box size using
+`/orders/addtag`, a small call that touches nothing else on the order.
+
+`cart_box_tags` maps box SKU to ShipStation tag. It is a table rather than a name
+match at run time, because a tag renamed in ShipStation would silently stop the
+tagging, and the mailers need a tag whose name does not match their dimensions.
+
+**A box with no row in that map is tagged `miss_size`.** ShipStation's order API can
+list tags but not create them, so a new size tag has to be made in the UI first, then
+added to `cart_box_tags`. 21 of the 38 boxes have their own tag today; the rest,
+including 7X4X3 and 18X18X10, fall back to `miss_size`.
+
 ### Results table (`inventory.cart_order_box`)
 
 One row per order, and that row is what keeps the order out of the queue.
@@ -78,6 +92,9 @@ One row per order, and that row is what keeps the order out of the queue.
 | `no_fit` | nothing fits, or an item has no dimensions; the reason is in `note` |
 | `error` | ShipStation refused; the reason is in `note` |
 | `void` | ignored, so the order goes back in the queue |
+
+`tag_id`, `tag_name` and `tagged_at` record what was tagged. A pushed row with no
+`tagged_at` is picked up by the catch-up pass on the next run.
 
 To box an order again, delete its row or set the status to `void`.
 

@@ -53,6 +53,7 @@ PUSH_PAUSE_SECONDS = float(os.environ.get("PUSH_PAUSE_SECONDS", "2.0"))
 PUSH_ONLY_ORDER = os.environ.get("PUSH_ONLY_ORDER", "").strip()
 
 SS_API = "https://ssapi.shipstation.com"
+MISS_SIZE_TAG_ID = int(os.environ.get("MISS_SIZE_TAG_ID", "108524"))  # the miss_size tag
 
 
 def connect():
@@ -280,8 +281,58 @@ def push_one(row, auth):
     return True, None
 
 
+def load_tag_map(conn):
+    """box SKU -> (tag id, tag name), from cart_box_tags."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT box_sku, tag_id, tag_name FROM cart_box_tags")
+        return {r["box_sku"]: (r["tag_id"], r["tag_name"]) for r in cur.fetchall()}
+
+
+def tag_order(order_id, tag_id, auth):
+    """Attach one tag to one order.
+
+    /orders/addtag is a small call that touches nothing but the tag, unlike the
+    dimensions write which has to repost the whole order.
+    """
+    ss_call("/orders/addtag", auth, {"orderId": order_id, "tagId": tag_id})
+
+
+def run_tag_backlog(conn, auth, tags):
+    """Tag orders that were pushed before tagging existed, or whose tag failed."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT order_id, order_number, box_sku, box_dimensions "
+            "FROM cart_order_box WHERE status='pushed' AND tagged_at IS NULL "
+            "ORDER BY pushed_at LIMIT %s",
+            (PUSH_LIMIT,),
+        )
+        rows = cur.fetchall()
+    if not rows:
+        return
+
+    log.info("tagging %d order(s) pushed earlier without a tag", len(rows))
+    for n, row in enumerate(rows):
+        tag_id, tag_name = tags.get(row["box_sku"], (MISS_SIZE_TAG_ID, "miss_size"))
+        try:
+            if not DRY_RUN:
+                tag_order(row["order_id"], tag_id, auth)
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE cart_order_box SET tag_id=%s, tag_name=%s, tagged_at=NOW() "
+                        "WHERE order_id=%s",
+                        (tag_id, tag_name, row["order_id"]),
+                    )
+            log.info("order %s: tagged %s", row["order_number"], tag_name)
+        except Exception as e:
+            log.error("order %s: tagging failed: %s", row["order_number"], e)
+            break
+        if n + 1 < len(rows):
+            time.sleep(PUSH_PAUSE_SECONDS)
+
+
 def run_push(conn, auth):
     """Push a small batch of assigned orders, oldest first."""
+    tags = load_tag_map(conn)
     sql = """
         SELECT order_id, order_number, box_sku, box_dimensions
         FROM cart_order_box
@@ -299,7 +350,7 @@ def run_push(conn, auth):
         rows = cur.fetchall()
 
     log.info("pushing %d order(s) to ShipStation", len(rows))
-    pushed = skipped = 0
+    pushed = skipped = tagged = 0
 
     failures = 0
     for n, row in enumerate(rows):
@@ -333,12 +384,29 @@ def run_push(conn, auth):
             pushed += 1
             log.info("order %s: set %s in ShipStation", row["order_number"],
                      row["box_dimensions"])
+
+            # Tag the order with its box size. A box with no tag of its own gets
+            # miss_size, because ShipStation's order API can list tags but not
+            # create them - new size tags have to be made in the UI.
+            tag_id, tag_name = tags.get(row["box_sku"], (MISS_SIZE_TAG_ID, "miss_size"))
+            if tag_name == "miss_size":
+                log.warning("order %s: no tag for %s; tagging miss_size",
+                            row["order_number"], row["box_dimensions"])
+            try:
+                if not DRY_RUN:
+                    tag_order(row["order_id"], tag_id, auth)
+                tagged += 1
+            except Exception as e:
+                tag_id = tag_name = None
+                log.error("order %s: tagging failed: %s", row["order_number"], e)
+
             if not DRY_RUN:
                 with conn.cursor() as cur:
                     cur.execute(
-                        "UPDATE cart_order_box SET status='pushed', pushed_at=NOW() "
+                        "UPDATE cart_order_box SET status='pushed', pushed_at=NOW(), "
+                        "tag_id=%s, tag_name=%s, tagged_at=IF(%s IS NULL, NULL, NOW()) "
                         "WHERE order_id=%s",
-                        (row["order_id"],),
+                        (tag_id, tag_name, tag_id, row["order_id"]),
                     )
         else:
             skipped += 1
@@ -353,7 +421,8 @@ def run_push(conn, auth):
         if n + 1 < len(rows):
             time.sleep(PUSH_PAUSE_SECONDS)
 
-    log.info("push done: %d sent, %d skipped", pushed, skipped)
+    log.info("push done: %d sent, %d tagged, %d skipped", pushed, tagged, skipped)
+    run_tag_backlog(conn, auth, tags)
 
 
 def main():
