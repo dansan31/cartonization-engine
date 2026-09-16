@@ -9,7 +9,8 @@ export MYSQL_PWD="$(gcloud secrets versions access latest --secret=SHIPSTATION_D
 
 echo "== 1. migration: add 'skipped', clear the stuck rows"
 mysql --socket="$SOCK" -u shipstation_user inventory \
-  -e "SET SESSION lock_wait_timeout=10; SOURCE ../sql/migrations/2026-09-16_cart_order_box_skipped.sql;"
+  --init-command="SET SESSION lock_wait_timeout=10" \
+  < ../sql/migrations/2026-09-16_cart_order_box_skipped.sql
 mysql --socket="$SOCK" -u shipstation_user inventory -t -e "
   SELECT b.status, o.order_status, COUNT(*) n
   FROM cart_order_box b JOIN shipstation.shipstation_orders o USING(order_id)
