@@ -51,6 +51,7 @@ LIMIT = int(os.environ.get("LIMIT", "500"))
 PUSH_LIMIT = int(os.environ.get("PUSH_LIMIT", "25"))
 PUSH_PAUSE_SECONDS = float(os.environ.get("PUSH_PAUSE_SECONDS", "2.0"))
 PUSH_ONLY_ORDER = os.environ.get("PUSH_ONLY_ORDER", "").strip()
+REBOX = os.environ.get("REBOX", "0") == "1"
 
 SS_API = "https://ssapi.shipstation.com"
 MISS_SIZE_TAG_ID = int(os.environ.get("MISS_SIZE_TAG_ID", "108524"))  # the miss_size tag
@@ -304,6 +305,163 @@ def tag_order(order_id, tag_id, auth):
     ss_call("/orders/addtag", auth, {"orderId": order_id, "tagId": tag_id})
 
 
+def measure_orders(conn, order_ids):
+    """Measure orders straight from the base tables.
+
+    v_cart_items and v_cart_orders only hold orders that still have no package
+    size, so an order the engine has already pushed has dropped out of them. The
+    rebox pass needs the same numbers for orders that are no longer in the queue.
+    """
+    if not order_ids:
+        return {}
+    placeholders = ",".join(["%s"] * len(order_ids))
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT oi.order_id, oi.sku, oi.quantity,
+                   d.l, d.w, d.h,
+                   COALESCE(c.padding_per_product, 0) AS pad_item,
+                   COALESCE(c.padding_per_order, 0)   AS pad_order
+            FROM shipstation.shipstation_order_items oi
+            JOIN inventory.skus s      ON s.sku = oi.sku
+            LEFT JOIN inventory.customers c ON c.customer_id = s.customer_id
+            CROSS JOIN LATERAL (
+                SELECT REPLACE(LOWER(s.dimensions), ' ', '') AS dims
+            ) t
+            CROSS JOIN LATERAL (
+                SELECT
+                  CASE WHEN t.dims REGEXP '^[0-9.]+x[0-9.]+x[0-9.]+$'
+                       THEN CAST(SUBSTRING_INDEX(t.dims,'x',1) AS DECIMAL(10,3)) END AS l,
+                  CASE WHEN t.dims REGEXP '^[0-9.]+x[0-9.]+x[0-9.]+$'
+                       THEN CAST(SUBSTRING_INDEX(SUBSTRING_INDEX(t.dims,'x',2),'x',-1) AS DECIMAL(10,3)) END AS w,
+                  CASE WHEN t.dims REGEXP '^[0-9.]+x[0-9.]+x[0-9.]+$'
+                       THEN CAST(SUBSTRING_INDEX(t.dims,'x',-1) AS DECIMAL(10,3)) END AS h
+            ) d
+            WHERE oi.order_id IN ({placeholders}) AND TRIM(oi.sku) <> ''
+            """,
+            tuple(order_ids),
+        )
+        rows = cur.fetchall()
+
+    orders = {}
+    for r in rows:
+        o = orders.setdefault(r["order_id"], {"items": [], "raw": Decimal("0"),
+                                              "padded": Decimal("0"), "pad_order": r["pad_order"]})
+        if r["l"] is None or r["w"] is None or r["h"] is None:
+            o["items"].append((r["sku"], None))
+            continue
+        vol = r["l"] * r["w"] * r["h"]
+        o["items"].append((r["sku"], tuple(sorted((r["l"], r["w"], r["h"]), reverse=True))))
+        o["raw"] += vol * r["quantity"]
+        o["padded"] += (vol + r["pad_item"]) * r["quantity"]
+
+    for o in orders.values():
+        o["padded"] += o["pad_order"]
+    return orders
+
+
+def untag_order(order_id, tag_id, auth):
+    """Take one tag off an order."""
+    ss_call("/orders/removetag", auth, {"orderId": order_id, "tagId": tag_id})
+
+
+def run_rebox(conn, auth, boxes, tags):
+    """Redo orders we boxed with a size that has since been retired.
+
+    Only touches orders whose dimensions in ShipStation are still exactly the ones
+    we wrote. If a person has changed the package since, the order is left alone -
+    the same rule that stops the normal push overwriting a packer's choice.
+
+    Turned on with REBOX=1. Run it after flagging boxes avoid_box, then leave it
+    off; there is nothing to do on an ordinary run.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT b.order_id, b.order_number, b.customer_id, b.box_sku,
+                   b.box_dimensions, b.tag_id, b.tag_name
+            FROM cart_order_box b
+            JOIN skus s ON s.sku = b.box_sku AND s.avoid_box = 1
+            WHERE b.status = 'pushed'
+            ORDER BY b.pushed_at
+            LIMIT %s
+            """,
+            (PUSH_LIMIT,),
+        )
+        rows = cur.fetchall()
+
+    if not rows:
+        log.info("rebox: nothing boxed with a retired size")
+        return
+
+    log.info("rebox: %d order(s) were boxed with a size now marked avoid_box", len(rows))
+    measured = measure_orders(conn, [r["order_id"] for r in rows])
+
+    for n, row in enumerate(rows):
+        oid = row["order_id"]
+        m = measured.get(oid)
+        if not m or not m["items"]:
+            log.warning("order %s: cannot measure it; skipping", row["order_number"])
+            continue
+
+        # measured fresh, so a padding or SKU dimension changed since the first
+        # run is taken into account
+        order = {"raw_volume_cu_in": m["raw"], "total_order_volume_cu_in": m["padded"]}
+        box, note = choose_box(order, boxes, m["items"])
+        if not box:
+            log.warning("order %s: no replacement box - %s", row["order_number"], note)
+            continue
+        if box["sku"] == row["box_sku"]:
+            continue
+
+        try:
+            live = ss_call(f"/orders/{oid}", auth)
+            if live.get("orderStatus") != "awaiting_shipment":
+                log.warning("order %s: now %s; leaving it alone",
+                            row["order_number"], live.get("orderStatus"))
+                continue
+
+            was = [float(x) for x in str(row["box_dimensions"]).lower().split("x")]
+            now = live.get("dimensions") or {}
+            if [now.get("length"), now.get("width"), now.get("height")] != was:
+                log.warning("order %s: package is %s, not the %s we set; leaving it alone",
+                            row["order_number"], now or "empty", row["box_dimensions"])
+                continue
+
+            l, w, h = [float(x) for x in str(box["box_dimensions"]).lower().split("x")]
+            live["dimensions"] = {"units": "inches", "length": l, "width": w, "height": h}
+            tag_id, tag_name = tags.get(box["sku"], (MISS_SIZE_TAG_ID, "miss_size"))
+
+            if DRY_RUN:
+                log.info("DRY RUN: order %s would move %s -> %s, tag %s -> %s",
+                         row["order_number"], row["box_dimensions"],
+                         box["box_dimensions"], row["tag_name"], tag_name)
+                continue
+
+            ss_call("/orders/createorder", auth, live)
+            if row["tag_id"] and row["tag_id"] != tag_id:
+                untag_order(oid, row["tag_id"], auth)
+            tag_order(oid, tag_id, auth)
+
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE cart_order_box SET box_sku=%s, box_dimensions=%s, "
+                    "box_volume_cu_in=%s, tag_id=%s, tag_name=%s, tagged_at=NOW(), "
+                    "pushed_at=NOW(), note=%s WHERE order_id=%s",
+                    (box["sku"], box["box_dimensions"], box["box_volume_cu_in"],
+                     tag_id, tag_name,
+                     f"reboxed from {row['box_dimensions']} (retired)", oid),
+                )
+            conn.commit()
+            log.info("order %s: %s -> %s, tagged %s", row["order_number"],
+                     row["box_dimensions"], box["box_dimensions"], tag_name)
+        except Exception as e:
+            log.error("order %s: rebox failed: %s", row["order_number"], e)
+
+        if n + 1 < len(rows):
+            time.sleep(PUSH_PAUSE_SECONDS)
+
+
 def run_tag_backlog(conn, auth, tags):
     """Tag orders that were pushed before tagging existed, or whose tag failed."""
     with conn.cursor() as cur:
@@ -466,6 +624,9 @@ def main():
             log.info("DRY RUN: nothing written")
         else:
             conn.commit()
+
+        if REBOX:
+            run_rebox(conn, ss_auth(), boxes, load_tag_map(conn))
 
         if PUSH_TO_SHIPSTATION:
             run_push(conn, ss_auth())
