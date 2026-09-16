@@ -7,7 +7,8 @@ inventory.cart_order_box.
 
 Writing a row to cart_order_box is what takes the order out of the queue, so a
 re-run never boxes the same order twice. To send an order back through, delete
-its row or set the row's status to 'void'.
+its row or set the row's status to 'void'. Rows the push step skips
+because the order shipped or already has a package size become 'skipped'.
 
 Box rule: the smallest box whose volume holds the order volume AND whose every
 side, compared longest to longest, holds each item on the order.
@@ -496,18 +497,27 @@ def run_tag_backlog(conn, auth, tags):
 
 
 def run_push(conn, auth):
-    """Push a small batch of assigned orders, oldest first."""
+    """Push a small batch of assigned orders, oldest first.
+
+    Only orders our ShipStation copy still shows as awaiting shipment with no
+    dimensions are picked. Without that filter, orders that shipped before their
+    push sat at the front of the batch and were retried every run, so nothing
+    newer was ever sent (2026-09-16).
+    """
     tags = load_tag_map(conn)
     sql = """
-        SELECT order_id, order_number, box_sku, box_dimensions
-        FROM cart_order_box
-        WHERE status = 'assigned' AND box_dimensions IS NOT NULL
+        SELECT b.order_id, b.order_number, b.box_sku, b.box_dimensions
+        FROM cart_order_box b
+        JOIN shipstation.shipstation_orders o ON o.order_id = b.order_id
+        WHERE b.status = 'assigned' AND b.box_dimensions IS NOT NULL
+          AND o.order_status = 'awaiting_shipment'
+          AND o.length_in IS NULL AND o.width_in IS NULL AND o.height_in IS NULL
     """
     params = []
     if PUSH_ONLY_ORDER:
-        sql += " AND order_number = %s"
+        sql += " AND b.order_number = %s"
         params.append(PUSH_ONLY_ORDER)
-    sql += " ORDER BY created_at LIMIT %s"
+    sql += " ORDER BY b.created_at LIMIT %s"
     params.append(1 if PUSH_ONLY_ORDER else PUSH_LIMIT)
 
     with conn.cursor() as cur:
@@ -576,11 +586,15 @@ def run_push(conn, auth):
         else:
             skipped += 1
             log.warning("order %s: not pushed - %s", row["order_number"], why)
+            # Shipped, or a package size already set: permanent, so the row
+            # leaves the push batch. ShipStation echoing back other dimensions
+            # is unexpected, so that one is parked as an error to look at.
+            status = "error" if why.startswith("ShipStation returned") else "skipped"
             if not DRY_RUN:
                 with conn.cursor() as cur:
                     cur.execute(
-                        "UPDATE cart_order_box SET note=%s WHERE order_id=%s",
-                        (why[:255], row["order_id"]),
+                        "UPDATE cart_order_box SET status=%s, note=%s WHERE order_id=%s",
+                        (status, why[:255], row["order_id"]),
                     )
 
         if n + 1 < len(rows):
