@@ -45,6 +45,20 @@ appear with fewer lines than it really has.
 `v_cart_boxes` reads the SKUs classified as `Shipping Box` that are active and do not
 have `avoid_box` set.
 
+**`skus.avoid_box` means "not meant for fulfillment"**, not "out of stock". Those boxes
+are stocked and used for other purposes, so the engine must never choose them. Setting
+the flag takes a box out of play on the next run, with no deploy. 17 are flagged today,
+including the three mailers and the sizes the engine once used most: 7X4X3, 5X5X3 and
+9X6X2. The smallest box available is 6X4X4.
+
+**`skus.is_mailer`** marks the mailers and bags. A mailer is judged on the goods alone,
+without the customer's padding: that padding is void fill, which goes around goods
+inside a box, and a mailer ships without it. Judging mailers on the padded volume made
+a 1.8 cu in order look like 81.8 and pushed it into a box. Their third dimension is a
+policy number - how thick you are willing to pack one, currently 1.5 in - not a
+measurement, since a mailer bulges to fit. All three are flagged `avoid_box` today, so
+this logic is dormant until one is put back in play.
+
 ### The job (`job/`)
 
 `main.py` picks a box, records it, and optionally pushes it. `deploy.sh` ships it,

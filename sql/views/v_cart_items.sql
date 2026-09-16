@@ -13,6 +13,7 @@ SELECT
     p.h                  AS product_height_in,
     ROUND(p.l * p.w * p.h, 2)                                                      AS product_volume_cu_in,
     COALESCE(c.padding_per_product, 0)                                             AS padding_per_product,
+    ROUND(p.l * p.w * p.h * oi.quantity, 2)                                        AS line_volume_cu_in,
     ROUND((p.l * p.w * p.h + COALESCE(c.padding_per_product, 0)) * oi.quantity, 2) AS total_volume_cu_in
 FROM shipstation.shipstation_orders o
 JOIN shipstation.shipstation_order_items oi ON oi.order_id = o.order_id

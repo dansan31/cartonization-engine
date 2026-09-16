@@ -3,6 +3,7 @@ SELECT
     s.sku,
     s.customer_id,
     s.description,
+    s.is_mailer,
     s.dimensions         AS box_dimensions,
     p.l                  AS box_length_in,
     p.w                  AS box_width_in,

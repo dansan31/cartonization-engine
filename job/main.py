@@ -80,7 +80,7 @@ def load_boxes(conn):
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT sku, box_dimensions, box_volume_cu_in,
+            SELECT sku, box_dimensions, box_volume_cu_in, is_mailer,
                    box_length_in, box_width_in, box_height_in
             FROM v_cart_boxes
             WHERE box_volume_cu_in IS NOT NULL
@@ -141,7 +141,7 @@ def load_queue(conn):
         cur.execute(
             """
             SELECT order_id, order_number, customer_id,
-                   total_order_volume_cu_in, max_item_side_in
+                   raw_volume_cu_in, total_order_volume_cu_in, max_item_side_in
             FROM v_cart_orders
             ORDER BY order_id
             LIMIT %s
@@ -156,10 +156,16 @@ def load_queue(conn):
 def choose_box(order, boxes, items):
     """Smallest box that holds the order's volume and every item's shape.
 
+    A mailer is judged on the goods alone. The padding a customer carries is void
+    fill - the paper and air pillows that go around goods inside a box - and a
+    mailer ships without it. Judging mailers on the padded volume made an order of
+    1.8 cu in look like 81.8 and pushed it into a box.
+
     Returns (box, note). box is None when nothing fits or the order cannot be
     measured; note explains why.
     """
     volume = order["total_order_volume_cu_in"]
+    raw_volume = order["raw_volume_cu_in"]
 
     if volume is None:
         return None, "order has an item with no dimensions"
@@ -169,7 +175,8 @@ def choose_box(order, boxes, items):
         return None, f"no dimensions for {unmeasured[0] if unmeasured else 'any item'}"
 
     for box in boxes:  # already sorted smallest first
-        if box["box_volume_cu_in"] < volume:
+        needs = raw_volume if box["is_mailer"] else volume
+        if needs is None or box["box_volume_cu_in"] < needs:
             continue
         if all(item_fits(triple, box["sides"]) for _, triple in items):
             return box, None
