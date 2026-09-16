@@ -92,8 +92,8 @@ tagging, and the mailers need a tag whose name does not match their dimensions.
 
 **A box with no row in that map is tagged `miss_size`.** ShipStation's order API can
 list tags but not create them, so a new size tag has to be made in the UI first, then
-added to `cart_box_tags`. 21 of the 38 boxes have their own tag today; the rest,
-including 7X4X3 and 18X18X10, fall back to `miss_size`.
+added to `cart_box_tags`. **All 24 usable boxes are mapped today**, so `miss_size` only
+appears when a new box size arrives without one.
 
 ### Results table (`inventory.cart_order_box`)
 
@@ -122,8 +122,29 @@ To box an order again, delete its row or set the status to `void`.
 | `PUSH_LIMIT` | `25` in code, `10` deployed | orders pushed per run |
 | `PUSH_PAUSE_SECONDS` | `2.0` | pause between ShipStation calls |
 | `PUSH_ONLY_ORDER` | — | push one order number only, for testing |
+| `REBOX` | `0` | `1` runs the rebox pass (below); leave off on ordinary runs |
+| `MISS_SIZE_TAG_ID` | `108524` | the `miss_size` tag |
 
 Credentials come from Secret Manager, never from the code.
+
+### Reboxing after a size is retired
+
+Flagging a box `avoid_box` stops it being chosen again, but orders already pushed keep
+the size they were given. `REBOX=1` re-measures those orders, moves them to the best
+box still available, and swaps the tag.
+
+It overwrites an order **only when ShipStation's dimensions are still exactly the ones
+we wrote**. If a person has touched the package since, the order is skipped - the same
+rule that stops the ordinary push overwriting a packer's choice.
+
+It measures from the order items rather than the stored row, because the queue views
+exclude orders that already have a size, and a stored volume predates any padding or
+SKU dimension changed since.
+
+```bash
+REBOX=1 DRY_RUN=1 ./run-local.sh   # see what would move
+REBOX=1 ./run-local.sh             # do it
+```
 
 ### `scripts/backfill_dimensions.py`
 
@@ -133,15 +154,39 @@ synced since the columns were added", not "no box". The queue could not tell the
 difference: of 197 orders it offered up, 172 already had a box in ShipStation. This
 fills in the real values for orders awaiting shipment. Run it with `--dry-run` first.
 
+## Everyday jobs
+
+**A new box size arrives.** Add the SKU with `classification = 'Shipping Box'` and its
+dimensions as `LxWxH`. Create the matching tag in the ShipStation UI, then add a row to
+`cart_box_tags`. Until that row exists the box is used but tagged `miss_size`.
+
+**A box should stop being used.** Set `skus.avoid_box = 1`. It leaves the running on the
+next run, no deploy. Then run the rebox pass if orders already went out with it.
+
+**An order needs boxing again.** Delete its `cart_order_box` row, or set the status to
+`void`. It only returns to the queue if it still has no size in ShipStation.
+
+**Stop the engine.** `gcloud scheduler jobs pause cartonization-engine-job
+--location=us-central1`. Resume with `resume`.
+
+**Change how tight the fit is.** `padding_per_product` and `padding_per_order` on the
+customers table. Both feed the arithmetic live. BeardBrand carries 80 cu in per order
+and BestSelf 1.75 per product; everyone else is 0, meaning no slack at all.
+
 ## Known gaps
 
-- **Padding is 0 for every customer.** `padding_per_product` and `padding_per_order` on
-  the customers table feed the arithmetic live, so filling them in tunes the engine
-  with no code change.
 - **Pillows are not vacuum-sealed yet.** Until they are, PILLOWD dimensions understate
-  the real packed size and its boxes will run small.
-- **Mailers have no volume.** Three envelope and bag SKUs carry only two dimensions, so
-  they never get picked.
+  the real packed size and its boxes will run small. Updating the SKU dimensions when
+  sealing starts is the whole fix.
+- **Mailers are flagged out of use.** The logic for them is built - they are judged on
+  the unpadded volume, and their depth is a policy number - but all three carry
+  `avoid_box`, so it lies dormant until one is put back in play.
 - **Every box belongs to `3PLFOUNDERS`**, so boxes cannot be matched to a customer.
-- **Unknown SKUs are skipped silently.** An order can be boxed on only the lines whose
-  SKUs exist in the master.
+- **Unknown SKUs are skipped silently.** An order is boxed on only the lines whose SKUs
+  exist in the master, so an order can be measured short. This is deliberate.
+- **Fit is per item, not a packing plan.** Each item is checked against the box on its
+  own; nothing works out whether they all fit together. Padding is the allowance for
+  that.
+- **ShipStation fills in some sizes itself**, so orders often acquire a package between
+  the engine choosing a box and pushing it. The push treats any existing size as
+  someone else's decision and leaves it alone.
