@@ -6,6 +6,10 @@
 -- A line whose SKU is neither an alias nor in skus is left out on purpose: it is
 -- something we do not pack (a store fulfilled elsewhere, such as Yaffa, or a
 -- digital item).
+--
+-- A Material with no dimensions is left out too: those are flyers, stickers and
+-- similar slim items that take no real room. Materials that do have dimensions
+-- still count. A Product with no dimensions still makes the order no_fit.
 CREATE OR REPLACE VIEW inventory.v_cart_items AS
 SELECT
     oi.order_id,
@@ -45,6 +49,7 @@ CROSS JOIN LATERAL (
 ) p
 WHERE o.order_status = 'awaiting_shipment'
   AND TRIM(oi.sku) <> ''
+  AND NOT (s.classification = 'Material' AND p.l IS NULL)
   AND o.length_in IS NULL
   AND o.width_in  IS NULL
   AND o.height_in IS NULL

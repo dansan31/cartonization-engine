@@ -488,6 +488,7 @@ def run_tag_backlog(conn, auth, tags):
                         "WHERE order_id=%s",
                         (tag_id, tag_name, row["order_id"]),
                     )
+                conn.commit()
             log.info("order %s: tagged %s", row["order_number"], tag_name)
         except Exception as e:
             log.error("order %s: tagging failed: %s", row["order_number"], e)
@@ -545,6 +546,7 @@ def run_push(conn, auth):
                          + (" - order not found there" if e.code == 404 else ""),
                          row["order_id"]),
                     )
+                conn.commit()
             failures += 1
             if failures >= 3:
                 log.error("three failures in a row; leaving the rest for the next run")
@@ -596,6 +598,12 @@ def run_push(conn, auth):
                         "UPDATE cart_order_box SET status=%s, note=%s WHERE order_id=%s",
                         (status, why[:255], row["order_id"]),
                     )
+
+        # Save each order as soon as ShipStation has it. A run killed mid-batch
+        # would otherwise lose the record of boxes it had already set, and the
+        # next run would mislabel those orders 'skipped'.
+        if not DRY_RUN:
+            conn.commit()
 
         if n + 1 < len(rows):
             time.sleep(PUSH_PAUSE_SECONDS)
